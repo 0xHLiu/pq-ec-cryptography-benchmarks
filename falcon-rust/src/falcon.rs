@@ -561,6 +561,7 @@ pub fn verify<const N: usize>(m: &[u8], sig: &Signature<N>, pk: &PublicKey<N>) -
 mod test {
     use itertools::Itertools;
     use rand::{rngs::StdRng, thread_rng, Rng, RngCore, SeedableRng};
+    use sha3::{Digest, Keccak256};
 
     use crate::{
         encoding::compress,
@@ -571,6 +572,16 @@ mod test {
 
     use super::{PublicKey, SecretKey};
 
+    #[test]
+    fn falcon_address() {
+        let (sk, pk) = keygen::<512>(thread_rng().gen());
+        eprintln!("{:?}", pk);
+        eprintln!("{:?}", pk.to_bytes());
+        let mut hasher = Keccak256::new();
+        hasher.update(pk.to_bytes());
+        let hash = hasher.finalize();
+        eprintln!("Address from Falcon key: {:x}", hash);
+    }
     #[test]
     fn test_operation_falcon_512() {
         let mut rng = thread_rng();

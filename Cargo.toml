@@ -2,3 +2,4 @@
 
 members = ["falcon-rust", "benchmark"]
 resolver = "2"
+

@@ -574,7 +574,7 @@ mod test {
 
     #[test]
     fn falcon_address() {
-        let (sk, pk) = keygen::<512>(thread_rng().gen());
+        let (_sk, pk) = keygen::<512>(thread_rng().gen());
         eprintln!("{:?}", pk);
         eprintln!("{:?}", pk.to_bytes());
         let mut hasher = Keccak256::new();

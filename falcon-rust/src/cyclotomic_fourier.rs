@@ -8,6 +8,7 @@ use num_complex::Complex64;
 
 use crate::inverse::Inverse;
 
+#[allow(dead_code)]
 pub(crate) trait CyclotomicFourier
 where
     Self: Sized

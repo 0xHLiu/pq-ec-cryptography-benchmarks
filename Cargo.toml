@@ -3,3 +3,5 @@
 members = ["falcon-rust", "benchmark"]
 resolver = "2"
 
+[workspace.dependencies]
+bitcoin_hashes = { version = ">= 0.12, <= 0.14", default-features = false}

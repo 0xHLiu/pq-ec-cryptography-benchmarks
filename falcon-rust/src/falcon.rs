@@ -300,8 +300,7 @@ pub struct PublicKey<const N: usize> {
     h: Polynomial<Felt>,
 
     #[cfg(feature = "pk_recovery_mode")]
-    h: Polynomial<Felt>,
-    // h: [u8; 64],
+    h: [u8; 64],
 }
 
 #[cfg(not(feature = "pk_recovery_mode"))]
@@ -388,13 +387,13 @@ impl<const N: usize> PublicKey<N> {
         let g_ntt = g.fft();
         let h_ntt = g_ntt.hadamard_div(&f_ntt);
         let h = h_ntt.ifft();
-        Self{h}
+        // Self{h}
 
-        // let bytes = Self::polynomial_to_bytes(h);
-        //
-        // let mut hasher = Sha3_512::new();
-        // hasher.update(bytes);
-        // Self {h: hasher.finalize().into()}
+        let bytes = Self::polynomial_to_bytes(h);
+
+        let mut hasher = Sha3_512::new();
+        hasher.update(bytes);
+        Self {h: hasher.finalize().into()}
     }
 
     // Serialize the public key as a list of bytes.
@@ -819,15 +818,15 @@ pub fn verify<const N: usize>(m: &[u8], sig: &Signature<N>, pk: &PublicKey<N>) -
     let pk_recovered_ntt = subtracted_value.hadamard_div(&s2_ntt);
     let pk_recovered = pk_recovered_ntt.ifft();
 
-    // let bytes = PublicKey::<N>::polynomial_to_bytes(recovered_pk_felt);
-    //
-    // let mut hasher = Sha3_512::new();
-    // hasher.update(bytes);
-    //
-    // let recovered_pk: [u8; 64] = hasher.finalize().into();
+    let bytes = PublicKey::<N>::polynomial_to_bytes(pk_recovered);
+
+    let mut hasher = Sha3_512::new();
+    hasher.update(bytes);
+
+    let recovered_pk: [u8; 64] = hasher.finalize().into();
     // eprintln!("recovered_pk: {:?}", recovered_pk);
     // println!("pk.h : {:?}", pk.h);
-    pk.h == pk_recovered
+    pk.h == recovered_pk
 }
 
 #[cfg(test)]
@@ -988,7 +987,6 @@ mod test {
         println!("{:?}", x);
         assert!(verify::<N>(&msg, &sig, &pk));
         println!("-> ok.");
-        println!("hashed public key: {:?}", pk);
     }
 
     #[cfg(not(feature = "pk_recovery_mode"))]

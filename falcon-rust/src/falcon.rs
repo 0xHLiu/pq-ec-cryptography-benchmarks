@@ -396,11 +396,60 @@ impl<const N: usize> PublicKey<N> {
         Self {h: hasher.finalize().into()}
     }
 
+    /// Deserialize the given slice of bytes into a public key.
+    pub fn from_bytes(byte_array: &[u8]) -> Result<Self, FalconDeserializationError> {
+        let n: usize = match byte_array.len() {
+            897 => 512,
+            1793 => 1024,
+            _ => return Err(FalconDeserializationError::BadEncodingLength),
+        };
+
+        // match against variant generic type parameter
+        if n != N {
+            return Err(FalconDeserializationError::WrongVariant);
+        }
+
+        // parse header
+        let header = byte_array[0];
+
+        if header >> 4 != 0 {
+            return Err(FalconDeserializationError::InvalidHeaderFormat);
+        }
+
+        let l = n.ilog2();
+        if header != l as u8 {
+            return Err(FalconDeserializationError::InvalidLogN);
+        }
+
+        // parse h
+        let bit_buffer = BitVec::from_bytes(&byte_array[1..]);
+        let h = Polynomial::new(
+            bit_buffer
+                .iter()
+                .chunks(14)
+                .into_iter()
+                .map(|ch| {
+                    let mut int = 0;
+                    for b in ch {
+                        int = (int << 1) | (b as i16);
+                    }
+                    int
+                })
+                .map(Felt::new)
+                .collect_vec(),
+        );
+
+        let bytes = Self::polynomial_to_bytes(h);
+        let mut hasher = Sha3_512::new();
+        hasher.update(bytes);
+
+        Ok(PublicKey{h: hasher.finalize().into()})
+    }
+
     // Serialize the public key as a list of bytes.
     fn polynomial_to_bytes(h: Polynomial<Felt>) -> Vec<u8> {
         let header = h.coefficients.len().ilog2() as u8;
         let mut bit_buffer = BitVec::from_bytes(&[header]);
-
         for hi in h.coefficients.iter() {
             for i in (0..14).rev() {
                 bit_buffer.push(hi.value() & (1 << i) != 0);
@@ -651,7 +700,6 @@ pub fn sign<const N: usize>(m: &[u8], sk: &SecretKey<N>) -> Signature<N> {
 pub fn sign<const N: usize>(m: &[u8], sk: &SecretKey<N>) -> Signature<N> {
     let mut rng = thread_rng();
     let mut r = [0u8; 40];
-    // TEMPORARILY CAUSE THE RNG TO BE 0
     rng.fill_bytes(&mut r);
 
     let params = FalconVariant::from_n(N).parameters();
@@ -786,6 +834,7 @@ pub fn verify<const N: usize>(m: &[u8], sig: &Signature<N>, pk: &PublicKey<N>) -
     let params = FalconVariant::from_n(N).parameters();
     let r_cat_m = [sig.r.to_vec(), m.to_vec()].concat();
     let c = hash_to_point(&r_cat_m, n);
+    let c_ntt = c.fft();
 
     // retrieveing s1, s2
     let s1 = match decompress(&sig.s1, n) {
@@ -803,8 +852,6 @@ pub fn verify<const N: usize>(m: &[u8], sig: &Signature<N>, pk: &PublicKey<N>) -
     let s1_ntt = Polynomial::new(s1.iter().map(|a| Felt::new(*a)).collect_vec()).fft();
     let s2_ntt = Polynomial::new(s2.iter().map(|a| Felt::new(*a)).collect_vec()).fft();
 
-    let c_ntt = c.fft();
-
     let length_squared = s1.iter().map(|&i| i as i64).map(|i| (i * i)).sum::<i64>()
         + s2.iter().map(|&i| i as i64).map(|i| (i * i)).sum::<i64>();
 
@@ -812,21 +859,14 @@ pub fn verify<const N: usize>(m: &[u8], sig: &Signature<N>, pk: &PublicKey<N>) -
     if length_squared >= params.sig_bound {false;}
 
     // pk = H(inverse(s2)*(HashToPoint(r||m, q, n) - s1))
-    // c = HashToPoint(r||m, q, n)
-    // pk = H((c-s1)/s2)
-    let subtracted_value = c_ntt.clone() - s1_ntt.clone();
-    let pk_recovered_ntt = subtracted_value.hadamard_div(&s2_ntt);
-    let pk_recovered = pk_recovered_ntt.ifft();
-
+    let pk_recovered = (c_ntt - s1_ntt).hadamard_div(&s2_ntt).ifft();
     let bytes = PublicKey::<N>::polynomial_to_bytes(pk_recovered);
-
     let mut hasher = Sha3_512::new();
     hasher.update(bytes);
+    let pk_recovered_hash: [u8; 64] = hasher.finalize().into();
 
-    let recovered_pk: [u8; 64] = hasher.finalize().into();
-    // eprintln!("recovered_pk: {:?}", recovered_pk);
-    // println!("pk.h : {:?}", pk.h);
-    pk.h == recovered_pk
+    // Verified if it matches the public key hash
+    pk.h == pk_recovered_hash
 }
 
 #[cfg(test)]

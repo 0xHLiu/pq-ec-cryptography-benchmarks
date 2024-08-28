@@ -460,7 +460,6 @@ impl<const N: usize> PublicKey<N> {
     }
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Signature<const N: usize> {
     r: [u8; 40],
@@ -836,7 +835,7 @@ pub fn verify<const N: usize>(m: &[u8], sig: &Signature<N>, pk: &PublicKey<N>) -
     let c = hash_to_point(&r_cat_m, n);
     let c_ntt = c.fft();
 
-    // retrieveing s1, s2
+    // retrieving s1, s2
     let s1 = match decompress(&sig.s1, n) {
         Some(success) => success,
         None => {
@@ -856,7 +855,9 @@ pub fn verify<const N: usize>(m: &[u8], sig: &Signature<N>, pk: &PublicKey<N>) -
         + s2.iter().map(|&i| i as i64).map(|i| (i * i)).sum::<i64>();
 
     // ensures that (s1,s2) <= beta**2
-    if length_squared >= params.sig_bound {false;}
+    if length_squared >= params.sig_bound {
+        eprintln!("Failed (s1,s2) <= beta**2");
+        false;}
 
     // pk = H(inverse(s2)*(HashToPoint(r||m, q, n) - s1))
     let pk_recovered = (c_ntt - s1_ntt).hadamard_div(&s2_ntt).ifft();
@@ -866,7 +867,20 @@ pub fn verify<const N: usize>(m: &[u8], sig: &Signature<N>, pk: &PublicKey<N>) -
     let pk_recovered_hash: [u8; 64] = hasher.finalize().into();
 
     // Verified if it matches the public key hash
-    pk.h == pk_recovered_hash
+    let success = pk.h == pk_recovered_hash;
+    // if success {
+    //     // eprintln!("Successfully matched public key hash");
+    // } else {
+    //     eprintln!("pk.h {:?}", pk.h);
+    //     eprintln!("pk_recovered {:?}", pk_recovered_hash);
+    //     eprintln!("s1 {:?}", s1);
+    //     eprintln!("s2 {:?}", s2);
+    //     eprintln!("s2_ntt invert {:?}", s2_ntt.hadamard_inv());
+    //     // eprintln!("c {:?}", c);
+    //     eprintln!("Failed matching public key hash");
+    // }
+
+    success
 }
 
 #[cfg(test)]

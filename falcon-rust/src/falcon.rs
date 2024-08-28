@@ -653,7 +653,7 @@ pub fn sign<const N: usize>(m: &[u8], sk: &SecretKey<N>) -> Signature<N> {
     let mut rng = thread_rng();
     let mut r = [0u8; 40];
     // TEMPORARILY CAUSE THE RNG TO BE 0
-    // rng.fill_bytes(&mut r);
+    rng.fill_bytes(&mut r);
 
     let params = FalconVariant::from_n(N).parameters();
     let bound = params.sig_bound;
@@ -704,97 +704,40 @@ pub fn sign<const N: usize>(m: &[u8], sk: &SecretKey<N>) -> Signature<N> {
             break [s0, s1];
         };
 
-        let s1_ = bold_s[0].ifft();
-        let s1 = s1_.coefficients
-            .iter()
-            .map(|a| -a.re.round() as i16)
-            .collect_vec();
-        let s2_ = bold_s[1].ifft();
-        let s2 = s2_.coefficients
-            .iter()
-            .map(|a| a.re.round() as i16)
-            .collect_vec();
+        let s1 = bold_s[0].ifft();
+        let s2 = bold_s[1].ifft();
 
-        eprintln!("s1 {:?}", s1);
-        eprintln!("s2 {:?}", s2);
-
-        // let maybe_s1 = compress(
-        //     &s1.coefficients
-        //         .iter()
-        //         .map(|a| a.re.round() as i16)
-        //         .collect_vec(),
-        //     params.sig_bytelen - 41,
-        // );
-
-        let maybe_s1 = compress(&s1,
-            params.sig_bytelen - 41,);
-
-        // let maybe_s2 = compress(
-        //     &s2.coefficients
-        //         .iter()
-        //         .map(|a| a.re.round() as i16)
-        //         .collect_vec(),
-        //     params.sig_bytelen - 41,
-        // );
+        let maybe_s1 = compress(
+            &s1.coefficients
+                .iter()
+                .map(|a| -a.re.round() as i16)
+                .collect_vec(),
+            params.sig_bytelen - 41,
+        );
+        let maybe_s2 = compress(
+            &s2.coefficients
+                .iter()
+                .map(|a| a.re.round() as i16)
+                .collect_vec(),
+            params.sig_bytelen - 41,
+        );
 
         let s1_output = match maybe_s1 {
-            Some(x) => {
-                x
+            Some(success) => {
+                success
             }
             None => {
                 continue;
             }
         };
-
-        let maybe_s2 = compress(&s2,
-                                params.sig_bytelen - 41,);
-
         let s2_output = match maybe_s2 {
-            Some(x) => {
-                x
+            Some(success) => {
+                success
             }
             None => {
                 continue;
             }
         };
-
-        // tests
-
-        let s1_test = match decompress(&s1_output, n) {
-            Some(success) => success,
-            None => {
-                continue;
-            }
-        };
-        let s1_ntt_pre = Polynomial::new(s1_test.iter().map(|a| Felt::new(*a)).collect_vec());
-        let s1_ntt = Polynomial::new(s1_test.iter().map(|a| Felt::new(*a)).collect_vec()).fft();
-
-        let s2_test = match decompress(&s2_output, n) {
-            Some(success) => success,
-            None => {
-                continue;
-            }
-        };
-        let s2_ntt_pre = Polynomial::new(s2_test.iter().map(|a| Felt::new(*a)).collect_vec());
-        let s2_ntt = Polynomial::new(s2_test.iter().map(|a| Felt::new(*a)).collect_vec()).fft();
-
-        eprintln!("s1_compressed {:?}", s1_output);
-        eprintln!("s2_compressed {:?}", s2_output);
-        eprintln!("s1_decompressed {:?}", s1_test);
-        eprintln!("s2_decompressed {:?}", s2_test);
-        eprintln!("s1_ntt_pre {:?}", s1_ntt_pre);
-        eprintln!("s2_ntt_pre {:?}", s2_ntt_pre);
-        eprintln!("s1_ntt {:?}", s1_ntt);
-        eprintln!("s2_ntt {:?}", s2_ntt);
-
-        let pk = PublicKey::from_secret_key(&sk);
-        eprintln!("h {:?}", pk.h);
-        let h_ntt = pk.h.fft();
-        eprintln!("h_ntt {:?}", h_ntt);
-
-        let c_derived = s1_ntt + s2_ntt.hadamard_mul(&h_ntt);
-        eprintln!("c {:?}", c);
-        eprintln!("c_derived {:?}", c_derived);
 
         break [s1_output, s2_output];
     };
@@ -838,39 +781,6 @@ pub fn verify<const N: usize>(m: &[u8], sig: &Signature<N>, pk: &PublicKey<N>) -
     length_squared < params.sig_bound
 }
 
-// #[cfg(feature = "pk_recovery_mode")]
-// pub fn verify<const N: usize>(m: &[u8], sig: &Signature<N>, pk: &PublicKey<N>) -> bool {
-//     let n = N;
-//     let params = FalconVariant::from_n(N).parameters();
-//     let r_cat_m = [sig.r.to_vec(), m.to_vec()].concat();
-//     let c = hash_to_point(&r_cat_m, n);
-//
-//     let s2 = match decompress(&sig.s2, n) {
-//         Some(success) => success,
-//         None => {
-//             return false;
-//         }
-//     };
-//     let s2_ntt = Polynomial::new(s2.iter().map(|a| Felt::new(*a)).collect_vec()).fft();
-//     let h_ntt = pk.h.fft();
-//     let c_ntt = c.fft();
-//
-//     // s1 = c - s2 * pk.h;
-//     let s1_ntt = c_ntt - s2_ntt.hadamard_mul(&h_ntt);
-//     eprintln!("s1_ntt {:?}", s1_ntt);
-//     let s1 = s1_ntt.ifft();
-//     eprintln!("s1 {:?}", s1);
-//
-//     let length_squared = s1
-//         .coefficients
-//         .iter()
-//         .map(|i| i.balanced_value() as i64)
-//         .map(|i| (i * i))
-//         .sum::<i64>()
-//         + s2.iter().map(|&i| i as i64).map(|i| (i * i)).sum::<i64>();
-//     length_squared < params.sig_bound
-// }
-
 #[cfg(feature = "pk_recovery_mode")]
 pub fn verify<const N: usize>(m: &[u8], sig: &Signature<N>, pk: &PublicKey<N>) -> bool {
     let n = N;
@@ -908,9 +818,6 @@ pub fn verify<const N: usize>(m: &[u8], sig: &Signature<N>, pk: &PublicKey<N>) -
     let subtracted_value = c_ntt.clone() - s1_ntt.clone();
     let pk_recovered_ntt = subtracted_value.hadamard_div(&s2_ntt);
     let pk_recovered = pk_recovered_ntt.ifft();
-    // println!("subtraction c_ntt - s1_ntt {:?}", subtracted_value);
-    // println!("recovered_pk_felt (ntt mode): {:?}", pk_recovered_ntt);
-    // println!("recovered_pk_felt: {:?}", pk_recovered);
 
     // let bytes = PublicKey::<N>::polynomial_to_bytes(recovered_pk_felt);
     //
@@ -1074,10 +981,6 @@ mod test {
         let mut rng = thread_rng();
         let mut msg = [0u8; 15];
         rng.fill_bytes(&mut msg);
-
-        println!("{:?}", msg);
-        // println!("Secret Key {:?}", sk);
-        println!("Public Key {:?}", pk);
 
         let sig = sign::<N>(&msg, &sk);
         println!("-> verify ...");

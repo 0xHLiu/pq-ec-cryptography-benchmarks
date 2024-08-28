@@ -1,8 +1,9 @@
 use bit_vec::BitVec;
 use itertools::Itertools;
 use num_complex::{Complex, Complex64};
-use rand::{thread_rng, Rng, RngCore};
-
+use rand::{thread_rng, Rng, RngCore, Error};
+use sha3::{Digest, Keccak256, Sha3_256, Sha3_512};
+use sha3::digest::consts::False;
 use crate::{
     encoding::{compress, decompress},
     fast_fft::FastFft,
@@ -295,9 +296,15 @@ impl<const N: usize> Eq for SecretKey<N> {}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PublicKey<const N: usize> {
+    #[cfg(not(feature = "pk_recovery_mode"))]
     h: Polynomial<Felt>,
+
+    #[cfg(feature = "pk_recovery_mode")]
+    h: Polynomial<Felt>,
+    // h: [u8; 64],
 }
 
+#[cfg(not(feature = "pk_recovery_mode"))]
 impl<const N: usize> PublicKey<N> {
     /// Compute the public key that matches with this secret key.
     pub fn from_secret_key(sk: &SecretKey<N>) -> Self {
@@ -371,14 +378,58 @@ impl<const N: usize> PublicKey<N> {
     }
 }
 
+#[cfg(feature = "pk_recovery_mode")]
+impl<const N: usize> PublicKey<N> {
+    /// Compute the public key that matches with this secret key.
+    pub fn from_secret_key(sk: &SecretKey<N>) -> Self {
+        let f = sk.b0[1].map(|&c| -Felt::new(c));
+        let f_ntt = f.fft();
+        let g = sk.b0[0].map(|&c| Felt::new(c));
+        let g_ntt = g.fft();
+        let h_ntt = g_ntt.hadamard_div(&f_ntt);
+        let h = h_ntt.ifft();
+        Self{h}
+
+        // let bytes = Self::polynomial_to_bytes(h);
+        //
+        // let mut hasher = Sha3_512::new();
+        // hasher.update(bytes);
+        // Self {h: hasher.finalize().into()}
+    }
+
+    // Serialize the public key as a list of bytes.
+    fn polynomial_to_bytes(h: Polynomial<Felt>) -> Vec<u8> {
+        let header = h.coefficients.len().ilog2() as u8;
+        let mut bit_buffer = BitVec::from_bytes(&[header]);
+
+        for hi in h.coefficients.iter() {
+            for i in (0..14).rev() {
+                bit_buffer.push(hi.value() & (1 << i) != 0);
+            }
+        }
+
+        bit_buffer.to_bytes()
+    }
+}
+
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Signature<const N: usize> {
     r: [u8; 40],
+
+    #[cfg(not(feature = "pk_recovery_mode"))]
     s: Vec<u8>,
+
+    #[cfg(feature = "pk_recovery_mode")]
+    s1: Vec<u8>,
+    #[cfg(feature = "pk_recovery_mode")]
+    s2: Vec<u8>,
 }
 
+#[cfg(not(feature = "pk_recovery_mode"))]
 impl<const N: usize> Signature<N> {
     /// Serialize the signature to a vector of bytes.
+    #[cfg(not(feature = "pk_recovery_mode"))]
     pub fn to_bytes(&self) -> Vec<u8> {
         // header
         let felt_encoding = 2; // standard (compressed)
@@ -392,6 +443,7 @@ impl<const N: usize> Signature<N> {
     }
 
     /// Deserialize a signature from a slice of bytes.
+    #[cfg(not(feature = "pk_recovery_mode"))]
     pub fn from_bytes(byte_vector: &[u8]) -> Result<Self, FalconDeserializationError> {
         // check signature length; infer variant
         let n = if byte_vector.len() == FalconVariant::Falcon512.parameters().sig_bytelen {
@@ -437,6 +489,77 @@ impl<const N: usize> Signature<N> {
     }
 }
 
+#[cfg(feature = "pk_recovery_mode")]
+impl<const N: usize> Signature<N> {
+    /// Serialize the signature to a vector of bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        // header
+        let felt_encoding = 2; // standard (compressed)
+        let n = self.s1.len();
+        let l = n.checked_ilog2().unwrap() as u8;
+        let header: u8 = (felt_encoding << 5)
+            | (1 << 4) // fixed bit
+            | l;
+
+        [vec![header], self.r.to_vec(), self.s1.clone(), self.s2.clone()].concat()
+    }
+
+    /// Deserialize a signature from a slice of bytes.
+    pub fn from_bytes(byte_vector: &[u8]) -> Result<Self, FalconDeserializationError> {
+        // check signature length; infer variant
+        let n = if byte_vector.len() == FalconVariant::Falcon512.parameters().sig_bytelen {
+            512
+        } else if byte_vector.len() == FalconVariant::Falcon1024.parameters().sig_bytelen {
+            1024
+        } else {
+            return Err(FalconDeserializationError::CannotInferFalconVariant);
+        };
+
+        let sig_length = if byte_vector.len() == FalconVariant::Falcon512.parameters().sig_bytelen {
+            625
+        } else if byte_vector.len() == FalconVariant::Falcon1024.parameters().sig_bytelen {
+            1239
+        } else {
+            return Err(FalconDeserializationError::CannotInferFalconVariant);
+        };
+
+        // match n against const type parameter
+        if n != N {
+            return Err(FalconDeserializationError::WrongVariant);
+        }
+
+        // read fields
+        let header = byte_vector[0];
+        let salt: [u8; 40] = byte_vector[1..=40].try_into().unwrap();
+        let s1_vector = &byte_vector[41..41+sig_length];
+        let s2_vector = &byte_vector[41+sig_length..];
+
+        // check encoding and reject if not standard
+        let felt_encoding: u8 = 2; // standard
+        if (header >> 5) & 3 != felt_encoding {
+            return Err(FalconDeserializationError::CannotDetermineFieldElementEncodingMethod);
+        }
+
+        // check fixed bits in header
+        if (header >> 7) != 0 || ((header >> 4) & 1) == 0 {
+            return Err(FalconDeserializationError::InvalidHeaderFormat);
+        }
+
+        // check log n
+        let logn = (header & 15) as usize;
+        if n != (1 << logn) {
+            return Err(FalconDeserializationError::InvalidLogN);
+        }
+
+        // tests pass; assemble object
+        Ok(Signature::<N> {
+            r: salt,
+            s1: s1_vector.to_vec(),
+            s2: s2_vector.to_vec(),
+        })
+    }
+}
+
 // Generate a key pair pseudorandomly by expanding a seed.
 pub fn keygen<const N: usize>(seed: [u8; 32]) -> (SecretKey<N>, PublicKey<N>) {
     let sk = SecretKey::generate_from_seed(seed);
@@ -449,6 +572,7 @@ pub fn keygen<const N: usize>(seed: [u8; 32]) -> (SecretKey<N>, PublicKey<N>) {
 /// Algorithm 10 of the specification [1, p.39].
 ///
 /// [1]: https://falcon-sign.info/falcon.pdf
+#[cfg(not(feature = "pk_recovery_mode"))]
 pub fn sign<const N: usize>(m: &[u8], sk: &SecretKey<N>) -> Signature<N> {
     let mut rng = thread_rng();
     let mut r = [0u8; 40];
@@ -524,9 +648,166 @@ pub fn sign<const N: usize>(m: &[u8], sk: &SecretKey<N>) -> Signature<N> {
     Signature { r, s }
 }
 
+#[cfg(feature = "pk_recovery_mode")]
+pub fn sign<const N: usize>(m: &[u8], sk: &SecretKey<N>) -> Signature<N> {
+    let mut rng = thread_rng();
+    let mut r = [0u8; 40];
+    // TEMPORARILY CAUSE THE RNG TO BE 0
+    // rng.fill_bytes(&mut r);
+
+    let params = FalconVariant::from_n(N).parameters();
+    let bound = params.sig_bound;
+    let n = params.n;
+
+    let r_cat_m = [r.to_vec(), m.to_vec()].concat();
+
+    let c = hash_to_point(&r_cat_m, n);
+    let one_over_q = 1.0 / (Q as f64);
+    let c_over_q_fft = c
+        .map(|cc| Complex::new(one_over_q * cc.value() as f64, 0.0))
+        .fft();
+
+    // B = [[FFT(g), -FFT(f)], [FFT(G), -FFT(F)]]
+    let capital_f_fft = sk.b0[3].map(|&i| Complex64::new(-i as f64, 0.0)).fft();
+    let f_fft = sk.b0[1].map(|&i| Complex64::new(-i as f64, 0.0)).fft();
+    let capital_g_fft = sk.b0[2].map(|&i| Complex64::new(i as f64, 0.0)).fft();
+    let g_fft = sk.b0[0].map(|&i| Complex64::new(i as f64, 0.0)).fft();
+    let t0 = c_over_q_fft.hadamard_mul(&capital_f_fft);
+    let t1 = -c_over_q_fft.hadamard_mul(&f_fft);
+
+    let s: [Vec<u8>; 2] = loop {
+        let bold_s = loop {
+            let z = ffsampling(&(t0.clone(), t1.clone()), &sk.tree, &params, &mut rng);
+            let t0_min_z0 = t0.clone() - z.0;
+            let t1_min_z1 = t1.clone() - z.1;
+
+            // s = (t-z) * B
+            let s0 = t0_min_z0.hadamard_mul(&g_fft) + t1_min_z1.hadamard_mul(&capital_g_fft);
+            let s1 = t0_min_z0.hadamard_mul(&f_fft) + t1_min_z1.hadamard_mul(&capital_f_fft);
+
+            // compute the norm of (s0||s1) and note that they are in FFT representation
+            let length_squared: f64 = (s0
+                .coefficients
+                .iter()
+                .map(|a| (a * a.conj()).re)
+                .sum::<f64>()
+                + s1.coefficients
+                .iter()
+                .map(|a| (a * a.conj()).re)
+                .sum::<f64>())
+                / (n as f64);
+
+            if length_squared > (bound as f64) {
+                continue;
+            }
+
+            break [s0, s1];
+        };
+
+        let s1_ = bold_s[0].ifft();
+        let s1 = s1_.coefficients
+            .iter()
+            .map(|a| -a.re.round() as i16)
+            .collect_vec();
+        let s2_ = bold_s[1].ifft();
+        let s2 = s2_.coefficients
+            .iter()
+            .map(|a| a.re.round() as i16)
+            .collect_vec();
+
+        eprintln!("s1 {:?}", s1);
+        eprintln!("s2 {:?}", s2);
+
+        // let maybe_s1 = compress(
+        //     &s1.coefficients
+        //         .iter()
+        //         .map(|a| a.re.round() as i16)
+        //         .collect_vec(),
+        //     params.sig_bytelen - 41,
+        // );
+
+        let maybe_s1 = compress(&s1,
+            params.sig_bytelen - 41,);
+
+        // let maybe_s2 = compress(
+        //     &s2.coefficients
+        //         .iter()
+        //         .map(|a| a.re.round() as i16)
+        //         .collect_vec(),
+        //     params.sig_bytelen - 41,
+        // );
+
+        let s1_output = match maybe_s1 {
+            Some(x) => {
+                x
+            }
+            None => {
+                continue;
+            }
+        };
+
+        let maybe_s2 = compress(&s2,
+                                params.sig_bytelen - 41,);
+
+        let s2_output = match maybe_s2 {
+            Some(x) => {
+                x
+            }
+            None => {
+                continue;
+            }
+        };
+
+        // tests
+
+        let s1_test = match decompress(&s1_output, n) {
+            Some(success) => success,
+            None => {
+                continue;
+            }
+        };
+        let s1_ntt_pre = Polynomial::new(s1_test.iter().map(|a| Felt::new(*a)).collect_vec());
+        let s1_ntt = Polynomial::new(s1_test.iter().map(|a| Felt::new(*a)).collect_vec()).fft();
+
+        let s2_test = match decompress(&s2_output, n) {
+            Some(success) => success,
+            None => {
+                continue;
+            }
+        };
+        let s2_ntt_pre = Polynomial::new(s2_test.iter().map(|a| Felt::new(*a)).collect_vec());
+        let s2_ntt = Polynomial::new(s2_test.iter().map(|a| Felt::new(*a)).collect_vec()).fft();
+
+        eprintln!("s1_compressed {:?}", s1_output);
+        eprintln!("s2_compressed {:?}", s2_output);
+        eprintln!("s1_decompressed {:?}", s1_test);
+        eprintln!("s2_decompressed {:?}", s2_test);
+        eprintln!("s1_ntt_pre {:?}", s1_ntt_pre);
+        eprintln!("s2_ntt_pre {:?}", s2_ntt_pre);
+        eprintln!("s1_ntt {:?}", s1_ntt);
+        eprintln!("s2_ntt {:?}", s2_ntt);
+
+        let pk = PublicKey::from_secret_key(&sk);
+        eprintln!("h {:?}", pk.h);
+        let h_ntt = pk.h.fft();
+        eprintln!("h_ntt {:?}", h_ntt);
+
+        let c_derived = s1_ntt + s2_ntt.hadamard_mul(&h_ntt);
+        eprintln!("c {:?}", c);
+        eprintln!("c_derived {:?}", c_derived);
+
+        break [s1_output, s2_output];
+    };
+
+    Signature { r,
+        s1: s[0].clone(),
+        s2: s[1].clone() }
+}
+
 /// Verify a signature. Algorithm 16 in the spec [1, p.45].
 ///
 /// [1]: https://falcon-sign.info/falcon.pdf
+#[cfg(not(feature = "pk_recovery_mode"))]
 pub fn verify<const N: usize>(m: &[u8], sig: &Signature<N>, pk: &PublicKey<N>) -> bool {
     let n = N;
     let params = FalconVariant::from_n(N).parameters();
@@ -557,11 +838,97 @@ pub fn verify<const N: usize>(m: &[u8], sig: &Signature<N>, pk: &PublicKey<N>) -
     length_squared < params.sig_bound
 }
 
+// #[cfg(feature = "pk_recovery_mode")]
+// pub fn verify<const N: usize>(m: &[u8], sig: &Signature<N>, pk: &PublicKey<N>) -> bool {
+//     let n = N;
+//     let params = FalconVariant::from_n(N).parameters();
+//     let r_cat_m = [sig.r.to_vec(), m.to_vec()].concat();
+//     let c = hash_to_point(&r_cat_m, n);
+//
+//     let s2 = match decompress(&sig.s2, n) {
+//         Some(success) => success,
+//         None => {
+//             return false;
+//         }
+//     };
+//     let s2_ntt = Polynomial::new(s2.iter().map(|a| Felt::new(*a)).collect_vec()).fft();
+//     let h_ntt = pk.h.fft();
+//     let c_ntt = c.fft();
+//
+//     // s1 = c - s2 * pk.h;
+//     let s1_ntt = c_ntt - s2_ntt.hadamard_mul(&h_ntt);
+//     eprintln!("s1_ntt {:?}", s1_ntt);
+//     let s1 = s1_ntt.ifft();
+//     eprintln!("s1 {:?}", s1);
+//
+//     let length_squared = s1
+//         .coefficients
+//         .iter()
+//         .map(|i| i.balanced_value() as i64)
+//         .map(|i| (i * i))
+//         .sum::<i64>()
+//         + s2.iter().map(|&i| i as i64).map(|i| (i * i)).sum::<i64>();
+//     length_squared < params.sig_bound
+// }
+
+#[cfg(feature = "pk_recovery_mode")]
+pub fn verify<const N: usize>(m: &[u8], sig: &Signature<N>, pk: &PublicKey<N>) -> bool {
+    let n = N;
+    let params = FalconVariant::from_n(N).parameters();
+    let r_cat_m = [sig.r.to_vec(), m.to_vec()].concat();
+    let c = hash_to_point(&r_cat_m, n);
+
+    // retrieveing s1, s2
+    let s1 = match decompress(&sig.s1, n) {
+        Some(success) => success,
+        None => {
+            return false;
+        }
+    };
+    let s2 = match decompress(&sig.s2, n) {
+        Some(success) => success,
+        None => {
+            return false;
+        }
+    };
+    let s1_ntt = Polynomial::new(s1.iter().map(|a| Felt::new(*a)).collect_vec()).fft();
+    let s2_ntt = Polynomial::new(s2.iter().map(|a| Felt::new(*a)).collect_vec()).fft();
+
+    let c_ntt = c.fft();
+
+    let length_squared = s1.iter().map(|&i| i as i64).map(|i| (i * i)).sum::<i64>()
+        + s2.iter().map(|&i| i as i64).map(|i| (i * i)).sum::<i64>();
+
+    // ensures that (s1,s2) <= beta**2
+    if length_squared >= params.sig_bound {false;}
+
+    // pk = H(inverse(s2)*(HashToPoint(r||m, q, n) - s1))
+    // c = HashToPoint(r||m, q, n)
+    // pk = H((c-s1)/s2)
+    let subtracted_value = c_ntt.clone() - s1_ntt.clone();
+    let pk_recovered_ntt = subtracted_value.hadamard_div(&s2_ntt);
+    let pk_recovered = pk_recovered_ntt.ifft();
+    // println!("subtraction c_ntt - s1_ntt {:?}", subtracted_value);
+    // println!("recovered_pk_felt (ntt mode): {:?}", pk_recovered_ntt);
+    // println!("recovered_pk_felt: {:?}", pk_recovered);
+
+    // let bytes = PublicKey::<N>::polynomial_to_bytes(recovered_pk_felt);
+    //
+    // let mut hasher = Sha3_512::new();
+    // hasher.update(bytes);
+    //
+    // let recovered_pk: [u8; 64] = hasher.finalize().into();
+    // eprintln!("recovered_pk: {:?}", recovered_pk);
+    // println!("pk.h : {:?}", pk.h);
+    pk.h == pk_recovered
+}
+
 #[cfg(test)]
 mod test {
     use itertools::Itertools;
     use rand::{rngs::StdRng, thread_rng, Rng, RngCore, SeedableRng};
-    use sha3::{Digest, Keccak256};
+    use sha3::{Digest, Keccak256, Sha3_256, Sha3_512};
+    use std::any::type_name;
 
     use crate::{
         encoding::compress,
@@ -572,6 +939,167 @@ mod test {
 
     use super::{PublicKey, SecretKey};
 
+    #[cfg(feature = "pk_recovery_mode")]
+    #[test]
+    fn pk_recovery_mode_light_test() {
+        let f = vec![
+            -4, -2, -5, -1, 4, -2, 0, -3, -1, 1, -2, -2, -6, -3, 3, -5, -1, 4, -3, -8, 4, -1, 2,
+            -1, -8, 5, -6, -3, 6, 0, -2, 4, 5, -6, 2, 3, 6, 4, 2, 3, 3, 7, 0, 1, 5, -3, -1, -9, -1,
+            6, -2, -5, 4, 0, 4, -2, 10, -4, -3, 4, -7, -1, -7, -2, -1, -6, 5, -1, -9, 3, 2, -5, 4,
+            -2, 2, -4, 4, -3, -1, 0, 5, 2, 2, -1, -9, -7, -2, -1, 0, 3, 1, 0, -1, -2, -5, 4, -1,
+            -1, 3, -1, 1, 4, -3, 2, -5, -2, 2, -4, 3, 6, 3, 9, 1, -2, 4, -1, -1, -6, -2, -2, 4, 5,
+            -1, 0, 10, -2, 1, -2, -3, 0, -4, -4, -1, 0, 1, -5, -3, -7, -2, -1, 2, -6, 3, 0, 0, 4,
+            -4, 0, 0, -5, -2, 5, -8, 8, 5, 4, 10, -4, 3, 8, 5, 1, -7, 0, -5, 0, -4, 3, -4, -2, 2,
+            -2, 6, 8, 2, -1, 4, -4, -2, 1, 0, 3, 7, 0, 9, -3, 1, 4, -3, 2, -1, 5, -8, 4, -1, 1, -8,
+            2, 4, -9, -3, 1, 3, -1, -7, 5, 5, 4, -3, 0, -7, -3, -1, -6, -7, 0, -3, 0, 3, -3, 0, -3,
+            1, 3, 4, -6, -6, -3, 6, 0, 2, -5, 1, -3, -6, -6, -1, -7, -2, -4, 3, 0, -4, -1, 2, 7,
+            -7, -2, 4, 2, 0, 1, -1, -3, 2, 1, 8, -1, 1, -2, 1, -1, 1, 4, 0, -4, 4, 3, -2, 6, -3,
+            -2, 1, 2, 3, 6, 5, -4, -7, -6, 4, 3, -4, 3, -3, 3, -3, 2, -1, 1, 5, -2, 2, 1, 0, -7, 0,
+            0, -1, 4, -3, 2, 1, -3, 5, 4, -6, -1, -3, 2, -1, -8, 4, 2, 4, 0, 1, -5, 8, 5, 4, -3,
+            -1, -2, 4, 0, 2, -2, 0, -2, -1, -7, 5, 0, 1, 2, 1, -2, 2, -1, 1, -4, 1, 0, 4, -4, 0, 5,
+            1, 4, -5, -2, -3, -2, 1, 3, 1, 2, 5, 12, 0, -1, 4, -6, 1, -4, 3, -5, -4, 4, 2, -2, -6,
+            1, 1, 3, -1, 0, -4, -4, -4, 6, -2, 4, -3, 0, -2, -1, 0, -6, -3, -2, 0, 6, 5, -5, -5, 3,
+            0, 3, -3, -2, 5, 7, -3, 1, -1, 0, 3, 0, 3, -7, 2, -4, -4, 1, 1, 1, 0, -3, -8, 3, 6, 1,
+            -2, -7, 3, 3, 4, -1, -2, -5, 9, 7, 1, 2, -4, 4, 0, -11, 3, 0, -3, -5, 5, -1, -1, 7, 6,
+            -1, 6, 3, 9, 5, -2, -3, -3, 1, -2, 0, -1, 1, -2, 2, 0, -5, -1, -4, -2, 2, -1, -3, 0,
+            -3, 0, 1, 3, -3, 2, 5, 8, -2, 3, -4, -7, 0, 4, -8, 1, 8, -2, 1, -1, 2, 0, -2, 1, 3, 3,
+            4, -2, -4, 3, -4, 2, 3, -2, -4, 1, -4, 10, 2,
+        ];
+        let g = vec![
+            -1, 5, -7, -1, -4, 6, 4, -1, -4, -13, -1, -5, -2, -8, 2, 1, 4, 2, 0, 0, 2, 0, -1, 2, 5,
+            -5, -8, 8, 1, 11, 0, -8, -4, 1, 1, -6, -4, 1, -3, 0, -10, -4, -6, -3, -2, 1, 6, 2, 8,
+            -2, 2, -2, 1, 3, -4, 2, -1, -1, -2, -2, -3, 0, -3, 2, -3, 2, -3, -4, 2, 3, 4, -5, 6,
+            -3, -2, -1, -1, -6, -2, 1, -4, -7, 8, 0, 2, -2, 2, 0, 1, 0, 4, 9, 7, 0, -1, -1, 4, -3,
+            -2, 6, 6, 0, 1, 7, -6, -5, 5, 1, 4, -1, 0, -2, 3, -4, 1, -1, -3, -2, 0, -1, -7, -8, -1,
+            2, 0, -5, 0, 1, -4, 6, -5, 6, 4, 1, -4, -5, 8, -1, 1, -2, 1, 1, 1, 3, 0, -1, 1, 1, -4,
+            -5, -4, 2, -3, 2, -2, 3, 7, -4, 4, -1, -2, 4, -4, -5, 2, 6, -7, 5, -1, 1, 3, 0, -5, -5,
+            3, -2, -3, -1, -6, 0, 2, 3, 2, 7, -3, -2, -2, 1, -5, 3, 3, -7, 0, 4, 4, -1, 2, -3, 1,
+            3, -1, -1, 0, -7, -6, -3, 7, -3, 5, -5, 1, -2, 0, 9, -2, 3, -1, -5, -3, -5, 3, 1, -4,
+            -3, 2, -2, 2, 8, -1, 0, 5, -3, -2, -6, 4, 0, 3, -3, -3, 4, -1, 0, 0, -2, -1, 3, 7, 4,
+            5, -1, 8, 0, -1, -6, -3, 4, 3, -3, 5, 2, -1, -2, 1, -1, 3, -2, -6, 4, 0, 0, -4, 1, 6,
+            2, 0, 10, 9, 2, -2, 0, 2, 1, -3, -1, -1, 3, 2, 1, 1, -3, -2, 7, 2, -1, 5, -3, -2, 1,
+            -2, 2, -2, -4, 3, 2, 1, -4, 1, 4, 3, -7, -4, 2, -5, -2, 5, -3, 1, -4, -5, 1, 0, 0, 0,
+            7, -5, -1, 2, 2, -3, 6, -6, 4, -3, -5, -6, -7, -4, 3, -2, -2, -10, -3, 2, -1, -6, -4,
+            1, 2, 2, 1, 4, 1, -5, -10, -2, 2, -4, 4, 4, -2, 1, 4, -3, 0, -6, -3, 1, 5, -7, -6, -4,
+            8, -1, 0, -1, 6, -3, -2, -2, 6, 2, 3, -3, -3, 5, -2, 1, 1, -4, -4, 8, 0, 3, 2, 3, 7, 4,
+            3, 2, -6, -9, 0, -8, 11, -2, 2, -2, -2, 3, 0, -6, 2, -1, 4, 2, -2, 0, -3, -7, -1, -1,
+            0, -1, -4, -2, -5, 3, -4, 2, 2, -1, -1, 7, -1, 3, 6, -7, 1, -5, 0, -7, 4, 3, -5, -1, 0,
+            3, -4, 1, 2, -7, 1, -2, -8, -2, -5, -5, 1, -4, -4, 4, -3, -2, 2, -4, -8, -1, 0, -9, 5,
+            -1, -2, 3, 2, 6, -1, 1, -1, -5, 5, 9, 3, -6, -5, 1, -6, 0, 2, -4, 6, 2, 7, 2, 15, 0,
+            -2, 9, 0, 1, 6, 4, -1, -1, -6, -3, 3, 1, -6, -3, 2, 2, -2,
+        ];
+        let capital_f = vec![
+            0, -25, -39, 21, 7, -5, -10, 4, -1, -38, -9, -1, 4, -23, 15, -1, 8, 1, -38, 41, 29, 22,
+            9, 12, -46, 0, 9, -17, -19, 32, 38, -3, 14, 6, 2, -6, -18, -1, 23, 80, -12, -20, 24,
+            22, -31, -38, -11, 8, 17, 18, 19, -10, 0, -1, 28, -5, -28, -33, 4, -31, -33, -8, -9,
+            -44, 46, -11, -5, -21, -22, -7, 1, -11, 33, -8, 12, -7, -6, 63, 17, 12, -49, -11, -31,
+            -8, 7, -28, 33, -28, -19, 8, 46, -73, 9, 32, 18, 7, -43, 0, -6, -4, 8, -39, -17, 11,
+            15, -25, -9, -28, -2, 24, -23, 10, -15, 4, 41, 46, 18, 2, -3, -29, 11, -3, 20, 35, 21,
+            23, 5, -8, -3, -27, -69, 0, 26, -29, -24, 8, 19, 6, -14, -18, 47, 5, 21, -50, 17, -44,
+            -36, 24, 9, 16, -38, -5, -54, 34, 13, 31, -2, 9, 8, -12, -14, -17, 28, -59, -20, 19,
+            31, 14, 14, 7, -32, 37, 5, -3, -7, -6, 21, -29, -33, 23, -25, -23, 14, 38, -29, -33,
+            -9, 23, -43, 18, -12, 2, 30, 32, -28, -21, 42, 1, 6, -6, 58, 34, -22, 1, 5, -2, -8, 14,
+            -19, -4, -6, 10, -3, -3, 32, 18, -19, -12, 49, 13, 4, -18, 57, 37, -19, 25, 14, 18,
+            -51, 13, 4, 4, 17, -37, -2, 1, 41, -36, -8, -13, 49, -6, 9, 46, -36, -6, -20, -18, -6,
+            -29, -42, -21, -25, -29, 5, -41, 51, 49, -20, -22, -9, 3, -6, -52, 10, 41, 12, -27,
+            -20, 31, -17, -23, -16, 3, 44, -3, -5, -2, 0, -22, 14, -30, -41, 3, -27, 3, 18, 38, 10,
+            49, 45, -13, -27, -4, -10, -67, -1, -17, -2, 72, 46, 20, 24, 22, 16, 25, 6, -6, -31, 2,
+            0, -13, -14, 9, 4, 31, 18, 22, 12, 59, -1, -3, -24, -47, -10, 48, 37, -34, -32, -4, 18,
+            -2, 52, -8, -7, 34, -44, -14, -21, -49, -35, 41, -4, 31, 3, 23, 9, 8, 0, -24, 38, -9,
+            -9, 4, -10, -55, -19, 21, 27, 22, 41, 6, -23, 41, -2, 28, -46, 20, 52, 16, 20, 32, 18,
+            2, -3, 9, 16, 33, -18, 12, 6, -9, -19, 1, -5, -15, -17, 6, -3, 4, -22, 30, -34, 43, -4,
+            9, -3, -33, -43, -5, -13, -56, 38, 16, 11, -36, 11, -4, -56, 2, 0, -19, -45, -8, -34,
+            16, 31, -3, 16, 27, -16, -9, 8, 45, -51, -20, 62, -17, -4, 4, 17, -45, 4, -15, -19, 39,
+            39, 15, 17, -19, 2, 45, 36, -22, 16, -23, 28, 34, 12, 5, 10, -7, 28, -35, 17, -37, -50,
+            -28, 19, -25, 9, 45, -6, -7, -16, 57, 27, 50, -30, 2, -10, -1, -57, -49, -23, 0, -9,
+            -36, -4, -3, 32, -6, -25, 67, -27, -19, 25, -6, 1, -17, -14, 0, 29, 26, -12, -20, 44,
+            14, 10, 8, -11, -18, -53, 22, 25, 27, 35, 6, -16, 12, 71, -8,
+        ];
+        let capital_g = vec![
+            27, 6, 12, -3, -31, -42, 27, 17, 11, 8, 34, 6, -3, 2, 11, -11, 18, 48, 1, 21, -7, -6,
+            9, 33, -18, -40, -55, -9, -71, -50, 32, -36, 11, 4, 29, 33, 10, -19, -43, -10, 22, -36,
+            -23, -21, -14, -47, 25, -4, -14, 30, 16, -18, -11, 6, -37, -27, -12, 6, 7, 33, -36, 33,
+            -2, 12, -21, 1, 16, 49, -11, -16, -41, 15, 11, 8, 20, -15, 26, -8, 11, -43, -36, 28, 2,
+            -47, -30, -47, -1, 1, 48, -6, -22, 24, -20, -3, -1, -15, -12, 62, 12, 7, -9, 15, -71,
+            49, 22, 27, 20, -8, -28, -13, -31, 18, 28, 54, 29, 5, 0, 33, -5, -22, -21, -12, -14,
+            -2, 11, -24, 32, -26, -71, 21, -15, -20, -12, 36, -5, 35, 46, 13, -34, -8, 10, -10, 10,
+            40, -52, 8, 0, 18, -33, -10, 8, 43, -8, -6, -31, -17, 19, 30, 12, -9, 8, -19, -32, -18,
+            -1, -37, 4, 43, 27, 14, -6, -14, -44, -34, -8, 16, -39, 13, 6, -32, 8, 17, -12, 23,
+            -44, -25, -66, -12, -31, 30, 14, -9, -5, -10, 44, -12, -2, -43, -22, -18, -7, -9, -15,
+            -7, -21, -27, -5, 1, -13, -10, 8, -8, 29, 21, 64, 47, -28, -9, -28, 25, -47, -34, -3,
+            -14, -26, -12, -5, -10, -27, -9, -14, -23, -2, -31, 28, 17, -4, -30, 31, 3, -15, 25, 9,
+            -32, 0, -6, -22, 20, -37, 3, 12, -19, -17, 13, 30, 11, -15, 15, 50, 66, -31, -31, 16,
+            2, 3, -8, 40, -21, -31, -2, 41, -29, -12, 9, 14, -4, 9, 8, -20, 28, 12, 20, -10, 5, -6,
+            -33, 6, 21, 51, 30, 9, 3, 8, 7, 19, -53, 19, 15, 4, -38, 19, 29, 18, 6, 19, 3, -17,
+            -32, 16, 3, 46, -6, -3, 47, 3, -66, 3, 25, -6, -6, 21, -24, -9, 28, -39, -42, 42, -6,
+            -19, -14, 6, -8, 9, 28, -4, 23, 12, -17, -13, 3, 3, 6, 44, 6, -5, 38, -4, -16, 12, -15,
+            8, -11, 45, 1, -16, 37, -35, 20, 26, 9, 13, 34, 25, -3, -10, -2, -42, -23, -22, -56,
+            -56, 6, 17, -9, 0, 36, 20, 6, -58, 12, 0, -3, -29, -49, -24, -12, -13, 5, -39, -8, 36,
+            -9, 44, 35, -64, -22, -12, 26, -15, 41, 36, -19, -37, -20, 46, 35, 9, 32, -5, 27, 21,
+            -36, -51, 19, 10, -23, 28, 46, 28, 8, 22, -31, 18, 2, -16, -9, 1, -22, -22, 31, 14, 5,
+            44, -3, 38, 0, -12, 50, -23, -19, 1, 42, 15, 1, 13, 32, 45, 37, 15, 11, -9, -23, -6,
+            -23, 36, 4, -34, -14, -14, -37, -28, 19, 20, 14, 24, -48, -34, -27, -34, -12, 9, -20,
+            -30, 25, 28, -51, -13, 11, -20, -1, -3, 6, -38, -46, -15, 28, 10, -4, 3, -1, 4, -40,
+            16, 61, 31, 28, 8, -2, 21, -3, -25, -12, -32, -15, -38, 20, -7, -35, 28, 29, 9, -27,
+        ];
+        let b0 = [
+            Polynomial::new(g),
+            Polynomial::new(f.into_iter().map(|i| -i).collect_vec()),
+            Polynomial::new(capital_g),
+            Polynomial::new(capital_f.into_iter().map(|i| -i).collect_vec()),
+        ];
+        let sk = SecretKey::<512>::from_b0(b0);
+        let pk = PublicKey::from_secret_key(&sk);
+        // println!("{:?}", sk);
+        // println!("{:?}", pk);
+
+        let mut msg = [0u8; 15];
+
+        let sig = sign::<512>(&msg, &sk);
+
+        println!("-> verify ...");
+        let x = verify::<512>(&msg, &sig, &pk);
+        println!("{:?}", x);
+        // assert!(verify::<512>(&msg, &sig, &pk));
+        // println!("-> ok.");
+        // println!("hashed public key: {:?}", pk);
+
+    }
+
+    #[cfg(feature = "pk_recovery_mode")]
+    #[test]
+    fn pk_hashed() {
+        const N: usize = 512;
+        let (sk, pk) = keygen::<N>(thread_rng().gen());
+        let mut rng = thread_rng();
+        let mut msg = [0u8; 15];
+        rng.fill_bytes(&mut msg);
+
+        println!("{:?}", msg);
+        // println!("Secret Key {:?}", sk);
+        println!("Public Key {:?}", pk);
+
+        let sig = sign::<N>(&msg, &sk);
+        println!("-> verify ...");
+        let x = verify::<N>(&msg, &sig, &pk);
+        println!("{:?}", x);
+        assert!(verify::<N>(&msg, &sig, &pk));
+        println!("-> ok.");
+        println!("hashed public key: {:?}", pk);
+    }
+
+    #[cfg(not(feature = "pk_recovery_mode"))]
+    #[test]
+    fn hash_pk() {
+        let (sk, pk) = keygen::<512>(thread_rng().gen());
+        eprintln!("{:?}", pk.to_bytes());
+        let mut hasher = sha3::Sha3_256::new();
+        hasher.update(pk.to_bytes());
+        let result = hasher.finalize();
+        eprintln!("{:?}", result.len());
+    }
+
+    #[cfg(not(feature = "pk_recovery_mode"))]
     #[test]
     fn falcon_address() {
         let (_sk, pk) = keygen::<512>(thread_rng().gen());
@@ -582,6 +1110,8 @@ mod test {
         let hash = hasher.finalize();
         eprintln!("Address from Falcon key: {:x}", hash);
     }
+
+    #[cfg(not(feature = "pk_recovery_mode"))]
     #[test]
     fn test_operation_falcon_512() {
         let mut rng = thread_rng();
@@ -592,13 +1122,149 @@ mod test {
         const N: usize = 512;
         println!("-> keygen ...");
         let (sk, pk) = keygen::<N>(rng.gen());
+        // println!("{:?}", sk);
+        // println!("{:?}", pk);
         println!("-> sign ...");
         let sig = sign::<N>(&msg, &sk);
+        println!("{:?}", sig);
         println!("-> verify ...");
         assert!(verify::<N>(&msg, &sig, &pk));
         println!("-> ok.");
     }
 
+    #[cfg(not(feature = "pk_recovery_mode"))]
+    #[test]
+    fn test_falcon512_correct_s1s2() {
+        let f = vec![
+            -4, -2, -5, -1, 4, -2, 0, -3, -1, 1, -2, -2, -6, -3, 3, -5, -1, 4, -3, -8, 4, -1, 2,
+            -1, -8, 5, -6, -3, 6, 0, -2, 4, 5, -6, 2, 3, 6, 4, 2, 3, 3, 7, 0, 1, 5, -3, -1, -9, -1,
+            6, -2, -5, 4, 0, 4, -2, 10, -4, -3, 4, -7, -1, -7, -2, -1, -6, 5, -1, -9, 3, 2, -5, 4,
+            -2, 2, -4, 4, -3, -1, 0, 5, 2, 2, -1, -9, -7, -2, -1, 0, 3, 1, 0, -1, -2, -5, 4, -1,
+            -1, 3, -1, 1, 4, -3, 2, -5, -2, 2, -4, 3, 6, 3, 9, 1, -2, 4, -1, -1, -6, -2, -2, 4, 5,
+            -1, 0, 10, -2, 1, -2, -3, 0, -4, -4, -1, 0, 1, -5, -3, -7, -2, -1, 2, -6, 3, 0, 0, 4,
+            -4, 0, 0, -5, -2, 5, -8, 8, 5, 4, 10, -4, 3, 8, 5, 1, -7, 0, -5, 0, -4, 3, -4, -2, 2,
+            -2, 6, 8, 2, -1, 4, -4, -2, 1, 0, 3, 7, 0, 9, -3, 1, 4, -3, 2, -1, 5, -8, 4, -1, 1, -8,
+            2, 4, -9, -3, 1, 3, -1, -7, 5, 5, 4, -3, 0, -7, -3, -1, -6, -7, 0, -3, 0, 3, -3, 0, -3,
+            1, 3, 4, -6, -6, -3, 6, 0, 2, -5, 1, -3, -6, -6, -1, -7, -2, -4, 3, 0, -4, -1, 2, 7,
+            -7, -2, 4, 2, 0, 1, -1, -3, 2, 1, 8, -1, 1, -2, 1, -1, 1, 4, 0, -4, 4, 3, -2, 6, -3,
+            -2, 1, 2, 3, 6, 5, -4, -7, -6, 4, 3, -4, 3, -3, 3, -3, 2, -1, 1, 5, -2, 2, 1, 0, -7, 0,
+            0, -1, 4, -3, 2, 1, -3, 5, 4, -6, -1, -3, 2, -1, -8, 4, 2, 4, 0, 1, -5, 8, 5, 4, -3,
+            -1, -2, 4, 0, 2, -2, 0, -2, -1, -7, 5, 0, 1, 2, 1, -2, 2, -1, 1, -4, 1, 0, 4, -4, 0, 5,
+            1, 4, -5, -2, -3, -2, 1, 3, 1, 2, 5, 12, 0, -1, 4, -6, 1, -4, 3, -5, -4, 4, 2, -2, -6,
+            1, 1, 3, -1, 0, -4, -4, -4, 6, -2, 4, -3, 0, -2, -1, 0, -6, -3, -2, 0, 6, 5, -5, -5, 3,
+            0, 3, -3, -2, 5, 7, -3, 1, -1, 0, 3, 0, 3, -7, 2, -4, -4, 1, 1, 1, 0, -3, -8, 3, 6, 1,
+            -2, -7, 3, 3, 4, -1, -2, -5, 9, 7, 1, 2, -4, 4, 0, -11, 3, 0, -3, -5, 5, -1, -1, 7, 6,
+            -1, 6, 3, 9, 5, -2, -3, -3, 1, -2, 0, -1, 1, -2, 2, 0, -5, -1, -4, -2, 2, -1, -3, 0,
+            -3, 0, 1, 3, -3, 2, 5, 8, -2, 3, -4, -7, 0, 4, -8, 1, 8, -2, 1, -1, 2, 0, -2, 1, 3, 3,
+            4, -2, -4, 3, -4, 2, 3, -2, -4, 1, -4, 10, 2,
+        ];
+        let g = vec![
+            -1, 5, -7, -1, -4, 6, 4, -1, -4, -13, -1, -5, -2, -8, 2, 1, 4, 2, 0, 0, 2, 0, -1, 2, 5,
+            -5, -8, 8, 1, 11, 0, -8, -4, 1, 1, -6, -4, 1, -3, 0, -10, -4, -6, -3, -2, 1, 6, 2, 8,
+            -2, 2, -2, 1, 3, -4, 2, -1, -1, -2, -2, -3, 0, -3, 2, -3, 2, -3, -4, 2, 3, 4, -5, 6,
+            -3, -2, -1, -1, -6, -2, 1, -4, -7, 8, 0, 2, -2, 2, 0, 1, 0, 4, 9, 7, 0, -1, -1, 4, -3,
+            -2, 6, 6, 0, 1, 7, -6, -5, 5, 1, 4, -1, 0, -2, 3, -4, 1, -1, -3, -2, 0, -1, -7, -8, -1,
+            2, 0, -5, 0, 1, -4, 6, -5, 6, 4, 1, -4, -5, 8, -1, 1, -2, 1, 1, 1, 3, 0, -1, 1, 1, -4,
+            -5, -4, 2, -3, 2, -2, 3, 7, -4, 4, -1, -2, 4, -4, -5, 2, 6, -7, 5, -1, 1, 3, 0, -5, -5,
+            3, -2, -3, -1, -6, 0, 2, 3, 2, 7, -3, -2, -2, 1, -5, 3, 3, -7, 0, 4, 4, -1, 2, -3, 1,
+            3, -1, -1, 0, -7, -6, -3, 7, -3, 5, -5, 1, -2, 0, 9, -2, 3, -1, -5, -3, -5, 3, 1, -4,
+            -3, 2, -2, 2, 8, -1, 0, 5, -3, -2, -6, 4, 0, 3, -3, -3, 4, -1, 0, 0, -2, -1, 3, 7, 4,
+            5, -1, 8, 0, -1, -6, -3, 4, 3, -3, 5, 2, -1, -2, 1, -1, 3, -2, -6, 4, 0, 0, -4, 1, 6,
+            2, 0, 10, 9, 2, -2, 0, 2, 1, -3, -1, -1, 3, 2, 1, 1, -3, -2, 7, 2, -1, 5, -3, -2, 1,
+            -2, 2, -2, -4, 3, 2, 1, -4, 1, 4, 3, -7, -4, 2, -5, -2, 5, -3, 1, -4, -5, 1, 0, 0, 0,
+            7, -5, -1, 2, 2, -3, 6, -6, 4, -3, -5, -6, -7, -4, 3, -2, -2, -10, -3, 2, -1, -6, -4,
+            1, 2, 2, 1, 4, 1, -5, -10, -2, 2, -4, 4, 4, -2, 1, 4, -3, 0, -6, -3, 1, 5, -7, -6, -4,
+            8, -1, 0, -1, 6, -3, -2, -2, 6, 2, 3, -3, -3, 5, -2, 1, 1, -4, -4, 8, 0, 3, 2, 3, 7, 4,
+            3, 2, -6, -9, 0, -8, 11, -2, 2, -2, -2, 3, 0, -6, 2, -1, 4, 2, -2, 0, -3, -7, -1, -1,
+            0, -1, -4, -2, -5, 3, -4, 2, 2, -1, -1, 7, -1, 3, 6, -7, 1, -5, 0, -7, 4, 3, -5, -1, 0,
+            3, -4, 1, 2, -7, 1, -2, -8, -2, -5, -5, 1, -4, -4, 4, -3, -2, 2, -4, -8, -1, 0, -9, 5,
+            -1, -2, 3, 2, 6, -1, 1, -1, -5, 5, 9, 3, -6, -5, 1, -6, 0, 2, -4, 6, 2, 7, 2, 15, 0,
+            -2, 9, 0, 1, 6, 4, -1, -1, -6, -3, 3, 1, -6, -3, 2, 2, -2,
+        ];
+        let capital_f = vec![
+            0, -25, -39, 21, 7, -5, -10, 4, -1, -38, -9, -1, 4, -23, 15, -1, 8, 1, -38, 41, 29, 22,
+            9, 12, -46, 0, 9, -17, -19, 32, 38, -3, 14, 6, 2, -6, -18, -1, 23, 80, -12, -20, 24,
+            22, -31, -38, -11, 8, 17, 18, 19, -10, 0, -1, 28, -5, -28, -33, 4, -31, -33, -8, -9,
+            -44, 46, -11, -5, -21, -22, -7, 1, -11, 33, -8, 12, -7, -6, 63, 17, 12, -49, -11, -31,
+            -8, 7, -28, 33, -28, -19, 8, 46, -73, 9, 32, 18, 7, -43, 0, -6, -4, 8, -39, -17, 11,
+            15, -25, -9, -28, -2, 24, -23, 10, -15, 4, 41, 46, 18, 2, -3, -29, 11, -3, 20, 35, 21,
+            23, 5, -8, -3, -27, -69, 0, 26, -29, -24, 8, 19, 6, -14, -18, 47, 5, 21, -50, 17, -44,
+            -36, 24, 9, 16, -38, -5, -54, 34, 13, 31, -2, 9, 8, -12, -14, -17, 28, -59, -20, 19,
+            31, 14, 14, 7, -32, 37, 5, -3, -7, -6, 21, -29, -33, 23, -25, -23, 14, 38, -29, -33,
+            -9, 23, -43, 18, -12, 2, 30, 32, -28, -21, 42, 1, 6, -6, 58, 34, -22, 1, 5, -2, -8, 14,
+            -19, -4, -6, 10, -3, -3, 32, 18, -19, -12, 49, 13, 4, -18, 57, 37, -19, 25, 14, 18,
+            -51, 13, 4, 4, 17, -37, -2, 1, 41, -36, -8, -13, 49, -6, 9, 46, -36, -6, -20, -18, -6,
+            -29, -42, -21, -25, -29, 5, -41, 51, 49, -20, -22, -9, 3, -6, -52, 10, 41, 12, -27,
+            -20, 31, -17, -23, -16, 3, 44, -3, -5, -2, 0, -22, 14, -30, -41, 3, -27, 3, 18, 38, 10,
+            49, 45, -13, -27, -4, -10, -67, -1, -17, -2, 72, 46, 20, 24, 22, 16, 25, 6, -6, -31, 2,
+            0, -13, -14, 9, 4, 31, 18, 22, 12, 59, -1, -3, -24, -47, -10, 48, 37, -34, -32, -4, 18,
+            -2, 52, -8, -7, 34, -44, -14, -21, -49, -35, 41, -4, 31, 3, 23, 9, 8, 0, -24, 38, -9,
+            -9, 4, -10, -55, -19, 21, 27, 22, 41, 6, -23, 41, -2, 28, -46, 20, 52, 16, 20, 32, 18,
+            2, -3, 9, 16, 33, -18, 12, 6, -9, -19, 1, -5, -15, -17, 6, -3, 4, -22, 30, -34, 43, -4,
+            9, -3, -33, -43, -5, -13, -56, 38, 16, 11, -36, 11, -4, -56, 2, 0, -19, -45, -8, -34,
+            16, 31, -3, 16, 27, -16, -9, 8, 45, -51, -20, 62, -17, -4, 4, 17, -45, 4, -15, -19, 39,
+            39, 15, 17, -19, 2, 45, 36, -22, 16, -23, 28, 34, 12, 5, 10, -7, 28, -35, 17, -37, -50,
+            -28, 19, -25, 9, 45, -6, -7, -16, 57, 27, 50, -30, 2, -10, -1, -57, -49, -23, 0, -9,
+            -36, -4, -3, 32, -6, -25, 67, -27, -19, 25, -6, 1, -17, -14, 0, 29, 26, -12, -20, 44,
+            14, 10, 8, -11, -18, -53, 22, 25, 27, 35, 6, -16, 12, 71, -8,
+        ];
+        let capital_g = vec![
+            27, 6, 12, -3, -31, -42, 27, 17, 11, 8, 34, 6, -3, 2, 11, -11, 18, 48, 1, 21, -7, -6,
+            9, 33, -18, -40, -55, -9, -71, -50, 32, -36, 11, 4, 29, 33, 10, -19, -43, -10, 22, -36,
+            -23, -21, -14, -47, 25, -4, -14, 30, 16, -18, -11, 6, -37, -27, -12, 6, 7, 33, -36, 33,
+            -2, 12, -21, 1, 16, 49, -11, -16, -41, 15, 11, 8, 20, -15, 26, -8, 11, -43, -36, 28, 2,
+            -47, -30, -47, -1, 1, 48, -6, -22, 24, -20, -3, -1, -15, -12, 62, 12, 7, -9, 15, -71,
+            49, 22, 27, 20, -8, -28, -13, -31, 18, 28, 54, 29, 5, 0, 33, -5, -22, -21, -12, -14,
+            -2, 11, -24, 32, -26, -71, 21, -15, -20, -12, 36, -5, 35, 46, 13, -34, -8, 10, -10, 10,
+            40, -52, 8, 0, 18, -33, -10, 8, 43, -8, -6, -31, -17, 19, 30, 12, -9, 8, -19, -32, -18,
+            -1, -37, 4, 43, 27, 14, -6, -14, -44, -34, -8, 16, -39, 13, 6, -32, 8, 17, -12, 23,
+            -44, -25, -66, -12, -31, 30, 14, -9, -5, -10, 44, -12, -2, -43, -22, -18, -7, -9, -15,
+            -7, -21, -27, -5, 1, -13, -10, 8, -8, 29, 21, 64, 47, -28, -9, -28, 25, -47, -34, -3,
+            -14, -26, -12, -5, -10, -27, -9, -14, -23, -2, -31, 28, 17, -4, -30, 31, 3, -15, 25, 9,
+            -32, 0, -6, -22, 20, -37, 3, 12, -19, -17, 13, 30, 11, -15, 15, 50, 66, -31, -31, 16,
+            2, 3, -8, 40, -21, -31, -2, 41, -29, -12, 9, 14, -4, 9, 8, -20, 28, 12, 20, -10, 5, -6,
+            -33, 6, 21, 51, 30, 9, 3, 8, 7, 19, -53, 19, 15, 4, -38, 19, 29, 18, 6, 19, 3, -17,
+            -32, 16, 3, 46, -6, -3, 47, 3, -66, 3, 25, -6, -6, 21, -24, -9, 28, -39, -42, 42, -6,
+            -19, -14, 6, -8, 9, 28, -4, 23, 12, -17, -13, 3, 3, 6, 44, 6, -5, 38, -4, -16, 12, -15,
+            8, -11, 45, 1, -16, 37, -35, 20, 26, 9, 13, 34, 25, -3, -10, -2, -42, -23, -22, -56,
+            -56, 6, 17, -9, 0, 36, 20, 6, -58, 12, 0, -3, -29, -49, -24, -12, -13, 5, -39, -8, 36,
+            -9, 44, 35, -64, -22, -12, 26, -15, 41, 36, -19, -37, -20, 46, 35, 9, 32, -5, 27, 21,
+            -36, -51, 19, 10, -23, 28, 46, 28, 8, 22, -31, 18, 2, -16, -9, 1, -22, -22, 31, 14, 5,
+            44, -3, 38, 0, -12, 50, -23, -19, 1, 42, 15, 1, 13, 32, 45, 37, 15, 11, -9, -23, -6,
+            -23, 36, 4, -34, -14, -14, -37, -28, 19, 20, 14, 24, -48, -34, -27, -34, -12, 9, -20,
+            -30, 25, 28, -51, -13, 11, -20, -1, -3, 6, -38, -46, -15, 28, 10, -4, 3, -1, 4, -40,
+            16, 61, 31, 28, 8, -2, 21, -3, -25, -12, -32, -15, -38, 20, -7, -35, 28, 29, 9, -27,
+        ];
+        let b0 = [
+            Polynomial::new(g),
+            Polynomial::new(f.into_iter().map(|i| -i).collect_vec()),
+            Polynomial::new(capital_g),
+            Polynomial::new(capital_f.into_iter().map(|i| -i).collect_vec()),
+        ];
+        let sk = SecretKey::<512>::from_b0(b0);
+        let pk = PublicKey::from_secret_key(&sk);
+
+        // let nonce = hex::decode(
+        //     "16c12515258093799956368cdfc182c1ca4a34f077e9244416a8c4c13fb0ca241e8b7ac1712d28eb",
+        // )
+        //     .unwrap();
+        let mut msg = [0u8; 5];
+        // let data = hex::decode("6461746131").unwrap();
+
+        let signature = sign::<512>(&msg, &sk);
+
+
+
+        // We can't recreate this signature because we do not have the seed that generated
+        // it.
+        // let obtained_signature = SignatureScheme::new(FalconVariant::Falcon512).sign(&data, &sk);
+
+
+
+        // assert!(verify::<512>(&data, &sig, &pk));
+    }
+
+    #[cfg(not(feature = "pk_recovery_mode"))]
     #[test]
     fn test_stalling_operation_falcon_1024() {
         // let seed: [u8; 32] = [
@@ -622,6 +1288,7 @@ mod test {
         println!("-> ok.");
     }
 
+    #[cfg(not(feature = "pk_recovery_mode"))]
     #[test]
     fn test_falcon512_test_vector() {
         let nonce = hex::decode(
@@ -782,10 +1449,12 @@ mod test {
         // it.
         // let obtained_signature = SignatureScheme::new(FalconVariant::Falcon512).sign(&data, &sk);
 
+
         let pk = PublicKey::from_secret_key(&sk);
         assert!(verify::<512>(&data, &sig, &pk));
     }
 
+    #[cfg(not(feature = "pk_recovery_mode"))]
     #[test]
     fn test_falcon512_hash_to_point() {
         let nonce = hex::decode(
@@ -845,6 +1514,7 @@ mod test {
         );
     }
 
+    #[cfg(not(feature = "pk_recovery_mode"))]
     #[test]
     fn test_falcon_1024_test_vector() {
         let nonce = hex::decode(
@@ -1127,6 +1797,7 @@ mod test {
         assert!(verify::<1024>(&data, &sig, &pk));
     }
 
+    #[cfg(not(feature = "pk_recovery_mode"))]
     fn signature_vector(n: usize) -> Vec<i16> {
         match n {
             512 => vec![
@@ -1231,6 +1902,7 @@ mod test {
         }
     }
 
+    #[cfg(not(feature = "pk_recovery_mode"))]
     #[test]
     fn test_signature_deserialize_success() {
         let n = 1024;
@@ -1278,6 +1950,7 @@ mod test {
         assert_eq!(serialized, reserialized);
     }
 
+    #[cfg(not(feature = "pk_recovery_mode"))]
     #[test]
     fn test_signature_deserialize_fail() {
         let n = 512;
@@ -1309,6 +1982,7 @@ mod test {
         assert!(Signature::<512>::from_bytes(&shorter).is_err());
     }
 
+    #[cfg(not(feature = "pk_recovery_mode"))]
     #[test]
     fn test_secret_key_serialization() {
         let sk = SecretKey::<512>::generate();
@@ -1320,6 +1994,7 @@ mod test {
         assert_eq!(serialized, reserialized);
     }
 
+    #[cfg(not(feature = "pk_recovery_mode"))]
     #[test]
     fn test_secret_key_serialization_fail() {
         let sk = SecretKey::<512>::generate();
@@ -1341,6 +2016,7 @@ mod test {
         assert!(SecretKey::<512>::from_bytes(shorter).is_err());
     }
 
+    #[cfg(not(feature = "pk_recovery_mode"))]
     #[test]
     fn test_public_key_serialization() {
         let pk = PublicKey::from_secret_key(&SecretKey::<512>::generate());
@@ -1352,6 +2028,7 @@ mod test {
         assert_eq!(serialized, reserialized);
     }
 
+    #[cfg(not(feature = "pk_recovery_mode"))]
     #[test]
     fn test_public_key_serialization_fail() {
         let pk = PublicKey::from_secret_key(&SecretKey::<512>::generate());
@@ -1373,6 +2050,7 @@ mod test {
         assert!(SecretKey::<512>::from_bytes(shorter).is_err());
     }
 
+    #[cfg(not(feature = "pk_recovery_mode"))]
     #[test]
     fn test_secret_key_field_element_serialization() {
         let mut rng = thread_rng();
@@ -1410,6 +2088,7 @@ mod test {
         }
     }
 
+    #[cfg(not(feature = "pk_recovery_mode"))]
     #[test]
     fn test_falcon1024_hash_to_point() {
         let nonce = hex::decode(

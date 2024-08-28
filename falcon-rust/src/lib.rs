@@ -55,6 +55,8 @@
 //! falcon512::Signature::from_bytes(&sig_buffer);
 //! ```
 
+#![allow(unused)]
+
 pub(crate) mod cyclotomic_fourier;
 pub(crate) mod encoding;
 pub(crate) mod falcon;

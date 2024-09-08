@@ -77,7 +77,6 @@ pub fn falcon_rust_operation(c: &mut Criterion) {
     let mut group = c.benchmark_group("falcon-rust-pk-recovery-mode");
     group.sample_size(NUM_KEYS * SIGS_PER_KEY);
     let mut iterator_verify_512 = 0;
-    let mut successful_verifications_512 = 0;
     group.bench_function("verify 512", |b| {
         b.iter(|| {
             let result = falcon_rust::falcon512::verify(
@@ -85,18 +84,10 @@ pub fn falcon_rust_operation(c: &mut Criterion) {
                 &sigs512[iterator_verify_512 % sigs512.len()],
                 &keys512[iterator_verify_512 % NUM_KEYS].1,
             );
-            if result {successful_verifications_512 += 1;}
-            // assert!(result);
+            assert!(result);
             iterator_verify_512 += 1;
         })
     });
-    // Something is failing every so often in the process, likely during signature generation
-    // Unsure what the cause is
-    // Checked that s2 can be inverted, so that doesn't seem to be the problem
-    // Leaving as is for the time being
-    println!("successful_verifications {:?}", successful_verifications_512);
-    println!("iterator_verify_512 {:?}", iterator_verify_512);
-    let mut successful_verifications_1024 = 0;
     let mut iterator_verify_1024 = 0;
     group.bench_function("verify 1024", |b| {
         b.iter(|| {
@@ -105,13 +96,10 @@ pub fn falcon_rust_operation(c: &mut Criterion) {
                 &sigs1024[iterator_verify_1024 % sigs1024.len()],
                 &keys1024[iterator_verify_1024 % NUM_KEYS].1,
             );
-            if result {successful_verifications_1024 += 1;}
-            // assert!(result);
+            assert!(result);
             iterator_verify_1024 += 1;
         })
     });
-    println!("successful_verifications_1024 {:?}", successful_verifications_1024);
-    println!("iterator_verify_1024 {:?}", iterator_verify_1024);
     group.finish();
 }
 

@@ -72,6 +72,7 @@ fn approx_exp(x: f64, ccs: f64) -> u64 {
 /// A random bool that is true with probability ≈ ccs · exp(−x).
 fn ber_exp(x: f64, ccs: f64, random_bytes: [u8; 7]) -> bool {
     // 0.69314718055994530941 = ln(2)
+    // eprintln!("{:?}",random_bytes.cop);
     let s = f64::floor(x / LN_2) as usize;
     let r = x - LN_2 * (s as f64);
     let shamt = usize::min(s, 63);

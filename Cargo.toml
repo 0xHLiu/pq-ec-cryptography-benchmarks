@@ -5,3 +5,9 @@ resolver = "2"
 
 [workspace.dependencies]
 bitcoin_hashes = { version = ">= 0.12, <= 0.14", default-features = false}
+
+[profile.test.package.proptest]
+opt-level = 3
+
+[profile.test.package.rand_chacha]
+opt-level = 3

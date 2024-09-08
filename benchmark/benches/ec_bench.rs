@@ -1,3 +1,5 @@
+// cargo bench --bench ec_bench
+
 #![allow(unused)]
 
 use std::{

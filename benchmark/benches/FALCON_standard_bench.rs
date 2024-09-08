@@ -1,3 +1,5 @@
+// cargo bench --bench FALCON_standard_bench
+
 #![allow(unused)]
 
 use std::{

@@ -48,12 +48,21 @@
 //! let sig = falcon512::sign(msg, &sk);
 //!
 //! let sk_buffer = sk.to_bytes();
+//!
+//! // pk recovery model won't allow to_bytes
+//! #[cfg(not(feature = "pk_recovery_mode"))]
 //! let pk_buffer = pk.to_bytes();
+//!
 //! let sig_buffer = sig.to_bytes();
 //! falcon512::SecretKey::from_bytes(&sk_buffer);
+//!
+//! #[cfg(not(feature = "pk_recovery_mode"))]
 //! falcon512::PublicKey::from_bytes(&pk_buffer);
+//!
 //! falcon512::Signature::from_bytes(&sig_buffer);
 //! ```
+
+#![allow(unused)]
 
 pub(crate) mod cyclotomic_fourier;
 pub(crate) mod encoding;

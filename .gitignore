@@ -1,4 +1,5 @@
 Cargo.lock
 target/*
 falcon-rust/target/*
-output.txt
+target/pk_recovery_mode.txt
+Results/*

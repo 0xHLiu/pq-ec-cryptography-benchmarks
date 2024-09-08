@@ -1,5 +1,6 @@
 use bit_vec::BitVec;
 use itertools::Itertools;
+use num::Zero;
 use num_complex::{Complex, Complex64};
 use rand::{thread_rng, Rng, RngCore, Error};
 use sha3::{Digest, Keccak256, Sha3_256, Sha3_512};
@@ -12,6 +13,7 @@ use crate::{
     math::ntru_gen,
     polynomial::{hash_to_point, Polynomial},
 };
+use crate::inverse::Inverse;
 
 #[derive(Copy, Clone, Debug)]
 pub struct FalconParameters {
@@ -753,6 +755,16 @@ pub fn sign<const N: usize>(m: &[u8], sk: &SecretKey<N>) -> Signature<N> {
         let s1 = bold_s[0].ifft();
         let s2 = bold_s[1].ifft();
 
+        let s2_ntt = Polynomial::new(s2.coefficients.iter().map(|a| Felt::new(a.re.round() as i16)).collect_vec()).fft();
+        let s2_inv = s2_ntt.hadamard_inv();
+        let s2_zero = s2_inv
+            .coefficients
+            .iter().
+            filter(|&&x| x.is_zero()).count();
+        if s2_zero > 0 {
+            continue;
+        }
+
         let maybe_s1 = compress(
             &s1.coefficients
                 .iter()
@@ -868,18 +880,6 @@ pub fn verify<const N: usize>(m: &[u8], sig: &Signature<N>, pk: &PublicKey<N>) -
 
     // Verified if it matches the public key hash
     let success = pk.h == pk_recovered_hash;
-    // if success {
-    //     // eprintln!("Successfully matched public key hash");
-    // } else {
-    //     eprintln!("pk.h {:?}", pk.h);
-    //     eprintln!("pk_recovered {:?}", pk_recovered_hash);
-    //     eprintln!("s1 {:?}", s1);
-    //     eprintln!("s2 {:?}", s2);
-    //     eprintln!("s2_ntt invert {:?}", s2_ntt.hadamard_inv());
-    //     // eprintln!("c {:?}", c);
-    //     eprintln!("Failed matching public key hash");
-    // }
-
     success
 }
 
@@ -889,14 +889,16 @@ mod test {
     use rand::{rngs::StdRng, thread_rng, Rng, RngCore, SeedableRng};
     use sha3::{Digest, Keccak256, Sha3_256, Sha3_512};
     use std::any::type_name;
-
+    use num::Zero;
+    use num_complex::{Complex, Complex64};
     use crate::{
         encoding::compress,
         falcon::{keygen, sign, verify, FalconVariant, Signature},
         field::Felt,
         polynomial::{hash_to_point, Polynomial},
     };
-
+    use crate::encoding::decompress;
+    use crate::fast_fft::FastFft;
     use super::{PublicKey, SecretKey};
 
     #[cfg(feature = "pk_recovery_mode")]
@@ -1041,6 +1043,24 @@ mod test {
         println!("{:?}", x);
         assert!(verify::<N>(&msg, &sig, &pk));
         println!("-> ok.");
+
+        assert_eq!(Complex64::new(0f64, 0f64), Complex::ZERO);
+    }
+
+    #[cfg(feature = "pk_recovery_mode")]
+    #[test]
+    fn pk_zero_div() {
+        const N: usize = 512;
+        let (sk, pk) = keygen::<N>(thread_rng().gen());
+        let mut rng = thread_rng();
+        let mut msg = [0u8; 15];
+        rng.fill_bytes(&mut msg);
+
+        for i in (0..100) {
+            let sig = sign::<N>(&msg, &sk);
+            assert!(verify::<N>(&msg, &sig, &pk));
+        }
+
     }
 
     #[cfg(not(feature = "pk_recovery_mode"))]
